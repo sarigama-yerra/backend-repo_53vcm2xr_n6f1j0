@@ -1,14 +1,29 @@
 import os
 import uuid
+from datetime import datetime, timedelta
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr
 from bson import ObjectId
 
-from database import db, create_document, get_documents
+from database import db, create_document
 from schemas import Clip
+
+# Auth settings
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecret-incommon-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+# Use a hash algorithm that does not require external C extensions
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+# Make token optional for endpoints that accept anonymous users
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 app = FastAPI(title="Incommon API")
 
@@ -24,6 +39,27 @@ app.add_middleware(
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+
+# ------------------- Models -------------------
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserPublic(BaseModel):
+    id: str
+    email: EmailStr
+    name: Optional[str] = None
+    handle: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: Optional[str] = None
+    handle: Optional[str] = None
 
 
 class ClipCreate(BaseModel):
@@ -43,6 +79,7 @@ class ClipPublic(BaseModel):
     location_lat: Optional[float] = None
     location_lng: Optional[float] = None
     place_name: Optional[str] = None
+    author_handle: Optional[str] = None
 
 
 class CommentCreate(BaseModel):
@@ -57,6 +94,41 @@ class CommentPublic(BaseModel):
     text: str
 
 
+# ------------------- Auth Utils -------------------
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> Optional[dict]:
+    if not token:
+        return None
+    if db is None:
+        # If DB is not configured, treat as anonymous
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            return None
+        doc = db["user"].find_one({"_id": ObjectId(user_id)})
+        return doc
+    except JWTError:
+        return None
+
+
+# ------------------- Basic -------------------
 @app.get("/")
 def read_root():
     return {"message": "Incommon backend running"}
@@ -103,15 +175,58 @@ def test_database():
     return response
 
 
-# ------------------- Uploads -------------------
+# ------------------- Auth Endpoints -------------------
+@app.post("/auth/register", response_model=UserPublic)
+def register(user: UserCreate):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    if db["user"].find_one({"email": user.email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    doc = {
+        "email": str(user.email),
+        "name": user.name,
+        "handle": user.handle or user.email.split("@")[0],
+        "password_hash": get_password_hash(user.password),
+        "avatar_url": None,
+        "is_active": True,
+    }
+    user_id = create_document("user", doc)
+    return UserPublic(id=user_id, email=user.email, name=user.name, handle=doc["handle"], avatar_url=None)
 
+
+@app.post("/auth/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    user = db["user"].find_one({"email": form_data.username})
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    if not verify_password(form_data.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+
+    token = create_access_token({"sub": str(user["_id"])})
+    return Token(access_token=token)
+
+
+@app.get("/auth/me", response_model=UserPublic)
+def me(current_user: dict = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return UserPublic(
+        id=str(current_user["_id"]),
+        email=current_user["email"],
+        name=current_user.get("name"),
+        handle=current_user.get("handle"),
+        avatar_url=current_user.get("avatar_url"),
+    )
+
+
+# ------------------- Uploads -------------------
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
     """Accept a video file upload and return a public URL under /uploads"""
-    # Basic validation by content type / filename
     allowed = {"video/mp4", "video/webm", "video/ogg", "application/octet-stream"}
     if file.content_type not in allowed:
-        # Allow unknown octet-stream from some browsers
         if not file.filename.lower().endswith((".mp4", ".webm", ".mov", ".ogg")):
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
@@ -131,9 +246,9 @@ async def upload_video(file: UploadFile = File(...)):
 
 
 # ------------------- Clips -------------------
-
 @app.post("/api/clips", response_model=ClipPublic)
-def create_clip(payload: ClipCreate):
+def create_clip(payload: ClipCreate, current_user: dict = Depends(get_current_user)):
+    author_handle = current_user.get("handle") if current_user else None
     clip = Clip(
         caption=payload.caption,
         video_url=payload.video_url,
@@ -141,7 +256,11 @@ def create_clip(payload: ClipCreate):
         location_lng=payload.location_lng,
         place_name=payload.place_name,
     )
-    inserted_id = create_document("clip", clip)
+    # persist + lightweight author handle
+    data = clip.model_dump()
+    if author_handle:
+        data["author_handle"] = author_handle
+    inserted_id = create_document("clip", data)
     return ClipPublic(
         id=inserted_id,
         caption=clip.caption,
@@ -151,6 +270,7 @@ def create_clip(payload: ClipCreate):
         location_lat=clip.location_lat,
         location_lng=clip.location_lng,
         place_name=clip.place_name,
+        author_handle=author_handle,
     )
 
 
@@ -164,6 +284,7 @@ def _serialize_clip(doc: dict) -> ClipPublic:
         location_lat=doc.get("location_lat"),
         location_lng=doc.get("location_lng"),
         place_name=doc.get("place_name"),
+        author_handle=doc.get("author_handle"),
     )
 
 
@@ -173,7 +294,20 @@ def list_clips(
     lng: Optional[float] = Query(None),
     radius_km: float = Query(10.0, alias="radiusKm"),
     limit: int = Query(20, ge=1, le=100),
+    north: Optional[float] = Query(None),
+    south: Optional[float] = Query(None),
+    east: Optional[float] = Query(None),
+    west: Optional[float] = Query(None),
 ):
+    # Bounds query (from map) takes precedence
+    if all(v is not None for v in [north, south, east, west]):
+        bbox_filter = {
+            "location_lat": {"$gte": south, "$lte": north},
+            "location_lng": {"$gte": west, "$lte": east},
+        }
+        docs = list(db["clip"].find(bbox_filter).sort("created_at", -1).limit(limit))
+        return [_serialize_clip(d) for d in docs]
+
     # If no location provided, return latest clips
     base_cursor = db["clip"].find({}).sort("created_at", -1).limit(limit)
     docs = list(base_cursor)
@@ -181,8 +315,6 @@ def list_clips(
     if lat is None or lng is None:
         return [_serialize_clip(d) for d in docs]
 
-    # Rough filter by bounding box first to reduce computation
-    # 1 degree of lat ~ 111 km; lng scaling by cos(lat)
     import math
     lat_delta = radius_km / 111.0
     lng_delta = radius_km / max(0.0001, (111.0 * abs(math.cos(math.radians(lat)))))
@@ -208,13 +340,12 @@ def like_clip(clip_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    db["clip"].update_one({"_id": _id}, {"$inc": {"like_count": 1}, "$set": {"updated_at": __import__('datetime').datetime.utcnow()}})
+    db["clip"].update_one({"_id": _id}, {"$inc": {"like_count": 1}, "$set": {"updated_at": datetime.utcnow()}})
     updated = db["clip"].find_one({"_id": _id})
     return _serialize_clip(updated)
 
 
 # ------------------- Comments -------------------
-
 @app.get("/api/clips/{clip_id}/comments", response_model=List[CommentPublic])
 def list_comments(clip_id: str, limit: int = Query(50, ge=1, le=200)):
     try:
@@ -238,7 +369,7 @@ def list_comments(clip_id: str, limit: int = Query(50, ge=1, le=200)):
 
 
 @app.post("/api/clips/{clip_id}/comments", response_model=CommentPublic)
-def create_comment(clip_id: str, payload: CommentCreate):
+def create_comment(clip_id: str, payload: CommentCreate, current_user: dict = Depends(get_current_user)):
     try:
         _id = ObjectId(clip_id)
     except Exception:
@@ -248,17 +379,23 @@ def create_comment(clip_id: str, payload: CommentCreate):
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
 
+    # prefer authenticated user's handle for author
+    author = None
+    if current_user:
+        author = current_user.get("handle") or current_user.get("email")
+    else:
+        author = payload.author
+
     comment_doc = {
         "clip_id": clip_id,
-        "author": payload.author,
+        "author": author,
         "text": payload.text,
     }
-    inserted_id = create_document("comment", comment_doc)  # helper adds timestamps
+    inserted_id = create_document("comment", comment_doc)
 
-    # increment comment_count on clip
-    db["clip"].update_one({"_id": _id}, {"$inc": {"comment_count": 1}, "$set": {"updated_at": __import__('datetime').datetime.utcnow()}})
+    db["clip"].update_one({"_id": _id}, {"$inc": {"comment_count": 1}, "$set": {"updated_at": datetime.utcnow()}})
 
-    return CommentPublic(id=inserted_id, clip_id=clip_id, author=payload.author, text=payload.text)
+    return CommentPublic(id=inserted_id, clip_id=clip_id, author=author, text=payload.text)
 
 
 # Simple schema endpoint for viewer tools
@@ -266,7 +403,6 @@ def create_comment(clip_id: str, payload: CommentCreate):
 def get_schema():
     try:
         from schemas import User, Clip as ClipSchema, Comment
-        # Return field descriptions
         return {
             "user": User.model_json_schema(),
             "clip": ClipSchema.model_json_schema(),
