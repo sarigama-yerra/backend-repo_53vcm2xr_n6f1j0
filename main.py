@@ -1,7 +1,9 @@
 import os
+import uuid
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from bson import ObjectId
 
@@ -17,6 +19,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static uploads directory
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
 class ClipCreate(BaseModel):
@@ -36,6 +43,18 @@ class ClipPublic(BaseModel):
     location_lat: Optional[float] = None
     location_lng: Optional[float] = None
     place_name: Optional[str] = None
+
+
+class CommentCreate(BaseModel):
+    author: Optional[str] = None
+    text: str
+
+
+class CommentPublic(BaseModel):
+    id: str
+    clip_id: str
+    author: Optional[str] = None
+    text: str
 
 
 @app.get("/")
@@ -82,6 +101,33 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
 
     return response
+
+
+# ------------------- Uploads -------------------
+
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...)):
+    """Accept a video file upload and return a public URL under /uploads"""
+    # Basic validation by content type / filename
+    allowed = {"video/mp4", "video/webm", "video/ogg", "application/octet-stream"}
+    if file.content_type not in allowed:
+        # Allow unknown octet-stream from some browsers
+        if not file.filename.lower().endswith((".mp4", ".webm", ".mov", ".ogg")):
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    ext = os.path.splitext(file.filename)[1] or ".mp4"
+    fname = f"{uuid.uuid4().hex}{ext}"
+    dest_path = os.path.join(UPLOAD_DIR, fname)
+
+    try:
+        contents = await file.read()
+        with open(dest_path, "wb") as f:
+            f.write(contents)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to save file")
+
+    public_url = f"/uploads/{fname}"
+    return {"url": public_url}
 
 
 # ------------------- Clips -------------------
@@ -137,8 +183,9 @@ def list_clips(
 
     # Rough filter by bounding box first to reduce computation
     # 1 degree of lat ~ 111 km; lng scaling by cos(lat)
+    import math
     lat_delta = radius_km / 111.0
-    lng_delta = radius_km / max(0.0001, (111.0 * abs(__import__('math').cos(__import__('math').radians(lat)))))
+    lng_delta = radius_km / max(0.0001, (111.0 * abs(math.cos(math.radians(lat)))))
 
     bbox_filter = {
         "location_lat": {"$gte": lat - lat_delta, "$lte": lat + lat_delta},
@@ -164,6 +211,54 @@ def like_clip(clip_id: str):
     db["clip"].update_one({"_id": _id}, {"$inc": {"like_count": 1}, "$set": {"updated_at": __import__('datetime').datetime.utcnow()}})
     updated = db["clip"].find_one({"_id": _id})
     return _serialize_clip(updated)
+
+
+# ------------------- Comments -------------------
+
+@app.get("/api/clips/{clip_id}/comments", response_model=List[CommentPublic])
+def list_comments(clip_id: str, limit: int = Query(50, ge=1, le=200)):
+    try:
+        _id = ObjectId(clip_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid clip id")
+
+    if not db["clip"].find_one({"_id": _id}):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    docs = list(db["comment"].find({"clip_id": clip_id}).sort("created_at", 1).limit(limit))
+    results: List[CommentPublic] = []
+    for d in docs:
+        results.append(CommentPublic(
+            id=str(d.get("_id")),
+            clip_id=d.get("clip_id"),
+            author=d.get("author"),
+            text=d.get("text"),
+        ))
+    return results
+
+
+@app.post("/api/clips/{clip_id}/comments", response_model=CommentPublic)
+def create_comment(clip_id: str, payload: CommentCreate):
+    try:
+        _id = ObjectId(clip_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid clip id")
+
+    clip = db["clip"].find_one({"_id": _id})
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    comment_doc = {
+        "clip_id": clip_id,
+        "author": payload.author,
+        "text": payload.text,
+    }
+    inserted_id = create_document("comment", comment_doc)  # helper adds timestamps
+
+    # increment comment_count on clip
+    db["clip"].update_one({"_id": _id}, {"$inc": {"comment_count": 1}, "$set": {"updated_at": __import__('datetime').datetime.utcnow()}})
+
+    return CommentPublic(id=inserted_id, clip_id=clip_id, author=payload.author, text=payload.text)
 
 
 # Simple schema endpoint for viewer tools
